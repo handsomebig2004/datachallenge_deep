@@ -1,3 +1,5 @@
 exp_outputs/Exp01_UNet_keep272/test_predictions/
 ./exp_outputs/Exp01_UNet_keep272/test_predictions/
 exp_outputs/Exp01_UNet_keep272/best.pt
+exp_outputs/Exp01_UNet_keep272/y_test_submission_MATCH_SAMPLE.csv
+exp_outputs/Exp01_UNet_keep272/y_test_submission.csv
