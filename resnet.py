@@ -1,15 +1,11 @@
 # -*- coding: utf-8 -*-
 """
 ResNet34-UNet（简化版，可直接跑）
-- 数据都在同一个目录：Desktop/deep_datachallenge/images
+- 训练图像目录：X_train_uDRk9z9/images（well1-6）
+- 测试图像目录：X_test_xNbnvIa/images（well7-11）
 - 训练标签：Y_train_T9NrBYo.csv（flatten + -1 padding）
-- 训练井：Well 1–6
-- 测试井：Well 7–11（同目录里筛选）
+- 验证：从训练集中按井划分（例：well6 为 val，其余为 train）
 - 输出：submission.csv（每行一个 patch，flatten，pad 到 160*272 用 -1）
-
-注意你只需要改：
-1) DATA_ROOT 路径
-2) EPOCHS/BATCH_SIZE 等超参数按你显存调整
 """
 
 import re
@@ -29,8 +25,10 @@ from torchvision.models import resnet34, ResNet34_Weights
 # =========================
 # 0. 超参数与路径
 # =========================
-DATA_ROOT = Path(r"C:\Users\lenovo\Desktop\deep_datachallenge") 
-IMAGES_DIR = DATA_ROOT / "images"
+DATA_ROOT = Path(r"C:\Users\lenovo\Desktop\deep_datachallenge")  # 改成你的真实路径
+
+TRAIN_IMAGES_DIR = DATA_ROOT / "X_train_uDRk9z9" / "images"
+TEST_IMAGES_DIR = DATA_ROOT / "X_test_xNbnvIa" / "images"
 Y_TRAIN_CSV = DATA_ROOT / "Y_train_T9NrBYo.csv"
 
 TARGET_H = 160
@@ -42,7 +40,7 @@ IGNORE_INDEX = -1        # CSV padding
 BATCH_SIZE = 8
 LR = 1e-3
 WEIGHT_DECAY = 1e-4
-EPOCHS = 20
+EPOCHS = 5               # 训练慢就先设 5，跑通后再加
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -77,7 +75,6 @@ def pad_to_160x272(img: np.ndarray, fill_value: float = 0.0) -> np.ndarray:
         out = np.full((TARGET_H, TARGET_W), fill_value, dtype=img.dtype)
         out[:, :w] = img
         return out
-    # 若更宽，简单裁剪（一般不会发生）
     return img[:, :TARGET_W]
 
 
@@ -105,31 +102,18 @@ def pad_mask_to_160x272(mask: np.ndarray) -> np.ndarray:
 
 
 # =========================
-# 2. Dataset（支持按 wells 过滤）
+# 2. Dataset（训练/测试共用）
 # =========================
 class WellSegDataset(Dataset):
-    def __init__(self, images_dir: Path, y_csv_path: Path = None, wells=None):
+    def __init__(self, images_dir: Path, y_csv_path: Path = None):
         """
-        wells: 例如 {1,2,3,4,5,6} 或 {7,8,9,10,11}
         y_csv_path=None 表示无标签（测试）
         """
         self.images_dir = images_dir
         self.has_label = y_csv_path is not None
 
-        all_paths = sorted(images_dir.glob("*.npy"))
-        all_names = [p.stem for p in all_paths]
-
-        if wells is not None:
-            keep = []
-            for p, n in zip(all_paths, all_names):
-                w = parse_well_id(n)
-                if w in wells:
-                    keep.append((p, n))
-            self.image_paths = [x[0] for x in keep]
-            self.names = [x[1] for x in keep]
-        else:
-            self.image_paths = all_paths
-            self.names = all_names
+        self.image_paths = sorted(images_dir.glob("*.npy"))
+        self.names = [p.stem for p in self.image_paths]
 
         if self.has_label:
             # CSV index 通常就是 patch 名（不含 .npy）
@@ -144,9 +128,8 @@ class WellSegDataset(Dataset):
         name = self.names[idx]
         img_path = self.image_paths[idx]
 
-        # 读图
-        img = np.load(img_path)              # (160,160) or (160,272)
-        raw_w = img.shape[1]                 # 记录原始宽度（推理时要裁回去）
+        img = np.load(img_path)        # (160,160) or (160,272)
+        raw_w = img.shape[1]           # 记录原始宽度（推理时裁回去）
         img = minmax_normalize(img)
         img = pad_to_160x272(img, fill_value=0.0)
         img_t = torch.from_numpy(img).unsqueeze(0).float()  # (1,160,272)
@@ -154,7 +137,6 @@ class WellSegDataset(Dataset):
         if not self.has_label:
             return {"name": name, "image": img_t, "raw_w": raw_w}
 
-        # 读 mask
         row = self.y_df.loc[name].values.astype(np.int64)
         mask = decode_mask_from_csv_row(row)     # (160,w)
         mask = pad_mask_to_160x272(mask)         # (160,272)
@@ -198,7 +180,7 @@ class ResNet34UNet(nn.Module):
         super().__init__()
         backbone = resnet34(weights=ResNet34_Weights.IMAGENET1K_V1)
 
-        # 输入单通道：把第一层卷积改成 1 通道
+        # 输入单通道：第一层卷积改成 1 通道（用原权重均值初始化）
         old_conv1 = backbone.conv1
         new_conv1 = nn.Conv2d(1, 64, kernel_size=7, stride=2, padding=3, bias=False)
         with torch.no_grad():
@@ -221,11 +203,11 @@ class ResNet34UNet(nn.Module):
         self.head = nn.Conv2d(64, num_classes, kernel_size=1)
 
     def forward(self, x):
-        e0 = self.enc0(x)               # 64, H/2, W/2
-        e1 = self.enc1(self.pool0(e0))  # 64, H/4, W/4
-        e2 = self.enc2(e1)              # 128, H/8, W/8
-        e3 = self.enc3(e2)              # 256, H/16, W/16
-        e4 = self.enc4(e3)              # 512, H/32, W/32
+        e0 = self.enc0(x)
+        e1 = self.enc1(self.pool0(e0))
+        e2 = self.enc2(e1)
+        e3 = self.enc3(e2)
+        e4 = self.enc4(e3)
 
         c = self.center(e4)
         d4 = self.up4(c, e3)
@@ -244,12 +226,11 @@ class ResNet34UNet(nn.Module):
 def train_one_epoch(model, loader, optimizer):
     model.train()
     total_loss = 0.0
-
     for batch in loader:
-        x = batch["image"].to(DEVICE)    # (B,1,160,272)
-        y = batch["mask"].to(DEVICE)     # (B,160,272) 包含 -1
+        x = batch["image"].to(DEVICE)
+        y = batch["mask"].to(DEVICE)
 
-        logits = model(x)                # (B,C,160,272)
+        logits = model(x)
         loss = F.cross_entropy(logits, y, ignore_index=IGNORE_INDEX)
 
         optimizer.zero_grad()
@@ -265,7 +246,6 @@ def train_one_epoch(model, loader, optimizer):
 def valid_one_epoch(model, loader):
     model.eval()
     total_loss = 0.0
-
     for batch in loader:
         x = batch["image"].to(DEVICE)
         y = batch["mask"].to(DEVICE)
@@ -281,32 +261,29 @@ def valid_one_epoch(model, loader):
 # 5. 推理并生成提交 CSV
 # =========================
 @torch.no_grad()
-def predict_and_make_submission(model, images_dir: Path, out_csv_path: Path, test_wells: set):
+def predict_and_make_submission(model, test_images_dir: Path, out_csv_path: Path):
     """
-    从 images_dir 中筛选 test_wells 预测并生成提交 CSV
+    对 test_images_dir 全部 npy 预测并生成提交 CSV
     - 每行：一个 patch
     - 长度：160*272
     - 如果原始宽度 < 272，剩余用 -1 padding
     """
     model.eval()
 
-    test_ds = WellSegDataset(images_dir, y_csv_path=None, wells=test_wells)
+    test_ds = WellSegDataset(test_images_dir, y_csv_path=None)
     test_loader = DataLoader(test_ds, batch_size=1, shuffle=False, num_workers=0)
 
     preds_dict = {}
 
     for batch in test_loader:
         name = batch["name"][0]
-        raw_w = int(batch["raw_w"][0])  # 原始宽度 160 或 272
-        x = batch["image"].to(DEVICE)   # (1,1,160,272)
+        raw_w = int(batch["raw_w"][0])
+        x = batch["image"].to(DEVICE)
 
-        logits = model(x)               # (1,C,160,272)
+        logits = model(x)
         pred_full = torch.argmax(logits, dim=1).squeeze(0).cpu().numpy().astype(np.int64)  # (160,272)
 
-        # 裁回原始宽度
-        pred = pred_full[:, :raw_w]     # (160,raw_w)
-
-        # flatten + pad 到 160*272
+        pred = pred_full[:, :raw_w]  # 裁回原始宽度
         if raw_w < TARGET_W:
             padded = np.full((TARGET_H * TARGET_W,), IGNORE_INDEX, dtype=np.int64)
             padded[: TARGET_H * raw_w] = pred.flatten()
@@ -320,20 +297,14 @@ def predict_and_make_submission(model, images_dir: Path, out_csv_path: Path, tes
 
 
 # =========================
-# 6. 主函数：严格按井划分训练/验证，测试井预测提交
+# 6. 主函数：训练(井1-5) + 验证(井6) + 预测test(井7-11目录)
 # =========================
 def main():
-    # ====== (A) 训练井与测试井定义 ======
-    TRAIN_WELLS = {1, 2, 3, 4, 5, 6}
-    TEST_WELLS = {7, 8, 9, 10, 11}
+    # (A) 构建训练集（well1-6）
+    train_ds_all = WellSegDataset(TRAIN_IMAGES_DIR, Y_TRAIN_CSV)
 
-    # 验证集：从训练井里“按井留出”避免泄漏（例：留 well6）
+    # (B) 按井划分 train/val：well6 做验证
     VAL_WELLS = {6}
-
-    # ====== (B) 构建训练集（只读 well1-6） ======
-    train_ds_all = WellSegDataset(IMAGES_DIR, Y_TRAIN_CSV, wells=TRAIN_WELLS)
-
-    # 按井划分 train/val
     train_indices, val_indices = [], []
     for i, name in enumerate(train_ds_all.names):
         w = parse_well_id(name)
@@ -342,19 +313,19 @@ def main():
         else:
             train_indices.append(i)
 
-    train_ds = Subset(train_ds_all, train_indices)
-    val_ds = Subset(train_ds_all, val_indices)
+    train_ds = Subset(train_ds_all, train_indices)  # well1-5
+    val_ds = Subset(train_ds_all, val_indices)      # well6
 
     train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True, num_workers=0)
     val_loader = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False, num_workers=0)
 
     print(f"训练样本数: {len(train_ds)} | 验证样本数: {len(val_ds)} | val_wells={VAL_WELLS}")
 
-    # ====== (C) 模型与优化器 ======
+    # (C) 模型与优化器
     model = ResNet34UNet(num_classes=NUM_CLASSES).to(DEVICE)
     optimizer = torch.optim.Adam(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
 
-    # ====== (D) 训练 ======
+    # (D) 训练
     best_val = 1e9
     best_path = DATA_ROOT / "best_resnet34_unet.pth"
 
@@ -369,10 +340,10 @@ def main():
             torch.save(model.state_dict(), best_path)
             print(f"  -> 保存最优模型: {best_path}")
 
-    # ====== (E) 生成提交（从同一个 images/ 里筛选 well7-11） ======
+    # (E) 生成提交（测试目录 well7-11）
     out_csv = DATA_ROOT / "submission.csv"
     model.load_state_dict(torch.load(best_path, map_location=DEVICE))
-    predict_and_make_submission(model, IMAGES_DIR, out_csv, test_wells=TEST_WELLS)
+    predict_and_make_submission(model, TEST_IMAGES_DIR, out_csv)
 
 
 if __name__ == "__main__":
