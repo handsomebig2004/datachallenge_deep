@@ -45,7 +45,7 @@ class WellDataset(Dataset):
         self.x_dir = Path(x_dir)
         self.y_df = y_df
         self.is_train = y_df is not None
-        files = sorted(self.x_dir.glob("*.npy"))
+        files = sorted(self.x_dir.rglob("*.npy"))
         if self.is_train:
             idx = set(self.y_df.index.astype(str))
             files = [p for p in files if p.stem in idx]
@@ -154,6 +154,9 @@ class SegNetVGG(nn.Module):
 # -----------------------
 @torch.no_grad()
 def make_submission(model, loader, device, out_csv: Path, size_labels=272):
+    if len(loader.dataset) == 0:
+        raise RuntimeError("Test dataset is empty. Check X_TEST_DIR path or use rglob for nested files.")
+    
     model.eval()
     rows = {}
 
@@ -183,7 +186,7 @@ def main():
     # ---- EDIT PATHS HERE ----
     ROOT = Path("data")
     X_TRAIN_DIR = ROOT / "X_train_uDRk9z9"
-    X_TEST_DIR  = ROOT / "X_test_xNbnvla"
+    X_TEST_DIR  = ROOT / "X_test_xNbnvIa"
     Y_TRAIN_CSV = ROOT / "Y_train_T9NrBYo.csv"
 
     train_size = (160,160)  # baseline-style resize :contentReference[oaicite:4]{index=4}
@@ -210,6 +213,9 @@ def main():
                    num_workers=2, pin_memory=torch.cuda.is_available(),
                    collate_fn=collate_test)
 
+    # print("len(ds_te) =", len(ds_te))
+    # print("len(dl_te) =", len(dl_te))
+
     model = SegNetVGG(in_channels=1, num_classes=num_classes).to(device)
     opt = torch.optim.Adam(model.parameters(), lr=lr)
     ce = nn.CrossEntropyLoss()
@@ -232,8 +238,8 @@ def main():
             n += 1
         print(f"epoch {ep:03d}/{epochs}  loss={running/max(1,n):.4f}")
 
-    torch.save({"model": model.state_dict(), "num_classes": num_classes}, "segnet_vgg.pth")
-    make_submission(model, dl_te, device, Path("submission_segnet_vgg.csv"), size_labels=272)
+    torch.save({"model": model.state_dict(), "num_classes": num_classes}, "model/segnet_vgg.pth")
+    make_submission(model, dl_te, device, Path("model/submission_segnet_vgg.csv"), size_labels=272)
 
 if __name__ == "__main__":
     import torch.multiprocessing as mp
