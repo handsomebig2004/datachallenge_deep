@@ -10,6 +10,25 @@ import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 from functools import partial
 
+# -----------------------
+# split utils (by well)
+# -----------------------
+_WELL_RE = re.compile(r"^well_(\d+)_section_(\d+)_patch_(\d+)$")
+
+def parse_patch_id(patch_id: str) -> tuple[int, int, int]:
+    m = _WELL_RE.match(patch_id)
+    if not m:
+        raise ValueError(f"Bad patch id format: {patch_id}")
+    return int(m.group(1)), int(m.group(2)), int(m.group(3))
+
+def split_ids_by_well(all_ids, val_wells: list[int]):
+    val_wells = set(val_wells)
+    tr_ids, va_ids = [], []
+    for pid in all_ids:
+        w, _, _ = parse_patch_id(str(pid))
+        (va_ids if w in val_wells else tr_ids).append(str(pid))
+    return tr_ids, va_ids
+
 
 # -----------------------
 # small utils
@@ -41,14 +60,21 @@ def resize_mask(y: torch.Tensor, size_hw):
 # dataset
 # -----------------------
 class WellDataset(Dataset):
-    def __init__(self, x_dir: Path, y_df: pd.DataFrame | None = None):
+    def __init__(self, x_dir: Path, y_df: pd.DataFrame | None = None, include_ids=None):
         self.x_dir = Path(x_dir)
         self.y_df = y_df
         self.is_train = y_df is not None
+
         files = sorted(self.x_dir.rglob("*.npy"))
+
         if self.is_train:
             idx = set(self.y_df.index.astype(str))
             files = [p for p in files if p.stem in idx]
+
+        if include_ids is not None:
+            keep = set(map(str, include_ids))
+            files = [p for p in files if p.stem in keep]
+
         self.files = files
 
     def __len__(self): return len(self.files)
@@ -73,18 +99,27 @@ class WellDataset(Dataset):
             item["mask"] = torch.from_numpy(mask)  # [160,W]
         return item
 
-def collate(batch, train_size=(160,160), is_train=True):
-    # pad to max H/W in batch then resize to train_size (baseline-style) :contentReference[oaicite:2]{index=2}
-    Hmax = max(b["img"].shape[-2] for b in batch)
-    Wmax = max(b["img"].shape[-1] for b in batch)
+def collate(batch, size_hw=(160, 272), is_train=True):
+    Ht, Wt = size_hw  # (160,272)
 
+    # 把所有图像pad到272
     imgs = []
     for b in batch:
         x = b["img"]
-        x = F.pad(x, (0, Wmax - x.shape[-1], 0, Hmax - x.shape[-2]), value=0.0)
+        H, W = x.shape[-2], x.shape[-1]
+        # 高度理论上都是160；这里做个保险
+        if H < Ht:
+            x = F.pad(x, (0, 0, 0, Ht - H), value=0.0)
+        elif H > Ht:
+            x = x[..., :Ht, :]
+
+        if W < Wt:
+            x = F.pad(x, (0, Wt - W, 0, 0), value=0.0)
+        elif W > Wt:
+            x = x[..., :, :Wt]
+
         imgs.append(x)
-    imgs = torch.stack(imgs, 0)          # [B,1,Hmax,Wmax]
-    imgs = resize_img(imgs, train_size)  # [B,1,160,160]
+    imgs = torch.stack(imgs, 0)          
 
     out = {"id":[b["id"] for b in batch], "orig_hw":[b["orig_hw"] for b in batch], "img":imgs}
 
@@ -92,10 +127,18 @@ def collate(batch, train_size=(160,160), is_train=True):
         masks = []
         for b in batch:
             y = b["mask"]  # [160,W]
-            y = F.pad(y, (0, Wmax - y.shape[-1], 0, 0), value=0)
+            H, W = y.shape[-2], y.shape[-1]
+
+            if H < Ht:
+                y = F.pad(y, (0, 0, 0, Ht - H), value=-1)
+            elif H > Ht:
+                y = y[:Ht, :]
+            if W < Wt:
+                y = F.pad(y, (0, Wt - W, 0, 0), value=-1) # pad -1 for ignore_index
+            elif W > Wt:
+                y = y[:, :Wt]
             masks.append(y)
         masks = torch.stack(masks, 0)         # [B,160,Wmax]
-        masks = resize_mask(masks, train_size) # [B,160,160]
         out["mask"] = masks
 
     return out
@@ -148,6 +191,31 @@ class SegNetVGG(nn.Module):
 
         return self.head(x)
 
+# iou  验证
+@torch.no_grad()
+def mean_iou_batch(logits, target, num_classes: int, ignore_index: int = -1):
+    # logits: [B,C,H,W], target: [B,H,W]
+    pred = torch.argmax(logits, dim=1)
+
+    ious = []
+    for b in range(pred.shape[0]):
+        p = pred[b].reshape(-1)
+        t = target[b].reshape(-1)
+        valid = (t != ignore_index)
+        p = p[valid]
+        t = t[valid]
+
+        per_class = []
+        for c in range(1, num_classes):  # 跳过背景0（按需改）
+            inter = torch.sum((p == c) & (t == c)).item()
+            union = torch.sum((p == c) | (t == c)).item()
+            if union > 0:
+                per_class.append(inter / union)
+
+        # 如果这一张图目标类都不存在，按官方通常视为 IoU=1（X,Y 都空时得分为1）:contentReference[oaicite:9]{index=9}
+        ious.append(1.0 if len(per_class) == 0 else sum(per_class) / len(per_class))
+
+    return float(sum(ious) / max(1, len(ious)))
 
 # -----------------------
 # train + predict + submit
@@ -189,41 +257,50 @@ def main():
     X_TEST_DIR  = ROOT / "X_test_xNbnvIa"
     Y_TRAIN_CSV = ROOT / "Y_train_T9NrBYo.csv"
 
-    train_size = (160,160)  # baseline-style resize :contentReference[oaicite:4]{index=4}
+    train_size = (160,272)
     batch_size = 16
     epochs = 20
     lr = 1e-4
-    collate_train = partial(collate, train_size=train_size, is_train=True)
-    collate_test  = partial(collate, train_size=train_size, is_train=False)
+    collate_train = partial(collate, size_hw=train_size, is_train=True)
+    collate_test  = partial(collate, size_hw=train_size, is_train=False)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     torch.backends.cudnn.benchmark = True  # speed up on fixed input size
 
     y_df = pd.read_csv(Y_TRAIN_CSV, index_col=0)
     num_classes = infer_num_classes(y_df)
-    print("device:", device, "num_classes:", num_classes, "train_samples:", len(y_df))
 
-    ds_tr = WellDataset(X_TRAIN_DIR, y_df=y_df)
-    dl_tr = DataLoader(ds_tr, batch_size=batch_size, shuffle=True,
-                   num_workers=2, pin_memory=torch.cuda.is_available(),
-                   collate_fn=collate_train)
+    # ---- split by well (choose your val wells) ----
+    val_wells = [3, 5]  # 你也可以试 [4] 或者 leave-one-well-out
+    tr_ids, va_ids = split_ids_by_well(y_df.index.astype(str), val_wells)
 
+    ds_tr = WellDataset(X_TRAIN_DIR, y_df=y_df, include_ids=tr_ids)
+    ds_va = WellDataset(X_TRAIN_DIR, y_df=y_df, include_ids=va_ids)
     ds_te = WellDataset(X_TEST_DIR, y_df=None)
+
+    dl_tr = DataLoader(ds_tr, batch_size=batch_size, shuffle=True,
+                    num_workers=2, pin_memory=torch.cuda.is_available(),
+                    collate_fn=collate_train)
+
+    dl_va = DataLoader(ds_va, batch_size=batch_size, shuffle=False,
+                    num_workers=2, pin_memory=torch.cuda.is_available(),
+                    collate_fn=collate_train)  # 验证也用同样collate
+    
     dl_te = DataLoader(ds_te, batch_size=batch_size, shuffle=False,
-                   num_workers=2, pin_memory=torch.cuda.is_available(),
-                   collate_fn=collate_test)
+                    num_workers=2, pin_memory=torch.cuda.is_available(),
+                    collate_fn=collate_test)
 
     # print("len(ds_te) =", len(ds_te))
     # print("len(dl_te) =", len(dl_te))
 
     model = SegNetVGG(in_channels=1, num_classes=num_classes).to(device)
     opt = torch.optim.Adam(model.parameters(), lr=lr)
-    ce = nn.CrossEntropyLoss()
+    ce = nn.CrossEntropyLoss(ignore_index=-1)
 
-    model.train()
+    best = -1.0
     for ep in range(1, epochs + 1):
-        running = 0.0
-        n = 0
+        model.train()
+        running, n = 0.0, 0
         for batch in dl_tr:
             x = batch["img"].to(device, non_blocking=True)
             y = batch["mask"].to(device, non_blocking=True)
@@ -236,10 +313,33 @@ def main():
 
             running += float(loss.item())
             n += 1
-        print(f"epoch {ep:03d}/{epochs}  loss={running/max(1,n):.4f}")
 
-    torch.save({"model": model.state_dict(), "num_classes": num_classes}, "model/segnet_vgg.pth")
-    make_submission(model, dl_te, device, Path("model/submission_segnet_vgg.csv"), size_labels=272)
+        # ---- val ----
+        model.eval()
+        miou_sum, m = 0.0, 0
+        for batch in dl_va:
+            x = batch["img"].to(device, non_blocking=True)
+            y = batch["mask"].to(device, non_blocking=True)
+            logits = model(x)
+            miou_sum += mean_iou_batch(logits, y, num_classes=num_classes, ignore_index=-1)
+            m += 1
+        val_miou = miou_sum / max(1, m)
+
+        print(f"epoch {ep:03d}/{epochs} loss={running/max(1,n):.4f}  val_mIoU={val_miou:.4f}")
+
+        if val_miou > best:
+            best = val_miou
+            torch.save({"model": model.state_dict(), "num_classes": num_classes}, "model/segnet_vgg_best.pth")
+            print("  saved best:", best)
+            
+    # 1) 用最后一轮（可选）
+    make_submission(model, dl_te, device, Path("model/submission_last.csv"), size_labels=272)
+
+    # 2) 用 best（推荐提交用这个）
+    ckpt = torch.load("model/segnet_vgg_best.pth", map_location=device)
+    model.load_state_dict(ckpt["model"])
+    make_submission(model, dl_te, device, Path("model/submission_best.csv"), size_labels=272)
+
 
 if __name__ == "__main__":
     import torch.multiprocessing as mp
