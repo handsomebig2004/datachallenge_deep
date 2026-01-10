@@ -1,1 +1,3 @@
 # datachallenge_deep
+segformer自监督训练分数：0,6493776259355356
+segformer半监督训练分数：0,6408664047073451
