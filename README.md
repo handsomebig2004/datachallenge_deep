@@ -46,6 +46,7 @@ transformer最强
 
 ### 你已用
 
+* **Mask2Former + Semi-Supervised Pseudo Label (Full runnable)0.6663556049927326
 * **SegFormer 0.649377**
 * **Mask2Former（更强但更复杂） 0.6441724128817745**
 * **UPerNet + Swin / ViT backbone  0.6402961815634437**
