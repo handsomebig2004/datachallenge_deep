@@ -13,8 +13,8 @@ from segnet import SegNetVGG, WellDataset, collate, make_submission
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--ckpt", type=str, default="model/segnet_vgg_best.pth", help="path to best checkpoint")
-    ap.add_argument("--x_test_dir", type=str, default="data/X_test_QB9kE8D", help="test npy directory")
-    ap.add_argument("--out_csv", type=str, default="model/submission_best.csv", help="output submission csv")
+    ap.add_argument("--x_test_dir", type=str, default="data/X_test_xNbnvIa", help="test npy directory")
+    ap.add_argument("--out_csv", type=str, default="model/submission_best_n.csv", help="output submission csv")
     ap.add_argument("--batch_size", type=int, default=16)
     ap.add_argument("--num_workers", type=int, default=2)
     ap.add_argument("--size_h", type=int, default=160, help="collate target height")
