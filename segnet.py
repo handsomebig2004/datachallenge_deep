@@ -259,7 +259,7 @@ def main():
 
     train_size = (160,272)
     batch_size = 16
-    epochs = 20
+    epochs = 10
     lr = 1e-4
     collate_train = partial(collate, size_hw=train_size, is_train=True)
     collate_test  = partial(collate, size_hw=train_size, is_train=False)
@@ -271,7 +271,7 @@ def main():
     num_classes = infer_num_classes(y_df)
 
     # ---- split by well (choose your val wells) ----
-    val_wells = [3, 5]  # 你也可以试 [4] 或者 leave-one-well-out
+    val_wells = []  # 你也可以试 [4] 或者 leave-one-well-out
     tr_ids, va_ids = split_ids_by_well(y_df.index.astype(str), val_wells)
 
     ds_tr = WellDataset(X_TRAIN_DIR, y_df=y_df, include_ids=tr_ids)
@@ -296,6 +296,21 @@ def main():
     model = SegNetVGG(in_channels=1, num_classes=num_classes).to(device)
     opt = torch.optim.Adam(model.parameters(), lr=lr)
     ce = nn.CrossEntropyLoss(ignore_index=-1)
+
+    # ---- load SSL encoder weights if available ----
+
+    ssl_ckpt = Path("model/segnet_ssl_dae.pth")
+    if ssl_ckpt.exists():
+        ckpt = torch.load(ssl_ckpt, map_location=device)
+        sd = ckpt["model"]
+        own = model.state_dict()
+        for k in sd:
+            if k.startswith("enc") and k in own and own[k].shape == sd[k].shape:
+                own[k].copy_(sd[k])
+        model.load_state_dict(own, strict=True)
+        print("Loaded SSL encoder weights from", ssl_ckpt)
+    else:
+        print("SSL ckpt not found, training from scratch.")
 
     best = -1.0
     for ep in range(1, epochs + 1):
@@ -331,7 +346,7 @@ def main():
             best = val_miou
             torch.save({"model": model.state_dict(), "num_classes": num_classes}, "model/segnet_vgg_best.pth")
             print("  saved best:", best)
-            
+
     # 1) 用最后一轮（可选）
     make_submission(model, dl_te, device, Path("model/submission_last.csv"), size_labels=272)
 
